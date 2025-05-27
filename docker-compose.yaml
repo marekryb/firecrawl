@@ -99,7 +99,7 @@ services:
       PORT: 3000
       SSE_LOCAL: true
     ports:
-      - 3603:3000
+      - 127.0.0.1:3603:3000
     networks:
       - backend
     extra_hosts:
