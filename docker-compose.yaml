@@ -55,6 +55,7 @@ services:
       BLOCK_MEDIA: ${BLOCK_MEDIA}
     networks:
       - backend
+    restart: unless-stopped
 
   api:
     <<: *common-service
@@ -69,6 +70,7 @@ services:
     ports:
       - "${PORT:-3002}:${INTERNAL_PORT:-3002}"
     command: ["pnpm", "run", "start:production"]
+    restart: unless-stopped
 
   worker:
     <<: *common-service
@@ -80,6 +82,7 @@ services:
       - playwright-service
       - api
     command: ["pnpm", "run", "workers"]
+    restart: unless-stopped
 
   redis:
     # NOTE: If you want to use Valkey (open source) instead of Redis (source available),
@@ -91,6 +94,7 @@ services:
     networks:
       - backend
     command: redis-server --bind 0.0.0.0
+    restart: unless-stopped
 
   mcpserver:
     image: ghcr.io/mendableai/firecrawl-mcp-server:latest
@@ -104,6 +108,7 @@ services:
       - backend
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    restart: unless-stopped
 
 networks:
   backend:
