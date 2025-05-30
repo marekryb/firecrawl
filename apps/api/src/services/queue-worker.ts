@@ -6,11 +6,8 @@ import {
   getScrapeQueue,
   getExtractQueue,
   getDeepResearchQueue,
-  redisConnection,
-  scrapeQueueName,
-  extractQueueName,
-  deepResearchQueueName,
   getIndexQueue,
+  redisConnection,
   getGenerateLlmsTxtQueue,
   getBillingQueue,
 } from "./queue-service";
@@ -54,6 +51,7 @@ import { scrapeOptions } from "../controllers/v1/types";
 import {
   cleanOldConcurrencyLimitEntries,
   cleanOldCrawlConcurrencyLimitEntries,
+  getConcurrencyLimitActiveJobs,
   pushConcurrencyLimitActiveJob,
   pushCrawlConcurrencyLimitActiveJob,
   removeConcurrencyLimitActiveJob,
@@ -85,6 +83,10 @@ import Express from "express";
 import http from "http";
 import https from "https";
 import { cacheableLookup } from "../scraper/scrapeURL/lib/cacheableLookup";
+import { robustFetch } from "../scraper/scrapeURL/lib/fetch";
+import { RateLimiterMode } from "../types";
+import { calculateCreditsToBeBilled } from "../lib/scrape-billing";
+import { redisEvictConnection } from "./redis";
 
 configDotenv();
 
@@ -129,11 +131,11 @@ async function finishCrawlIfNeeded(job: Job & { id: string }, sc: StoredCrawl) {
     logger.info("Crawl is pre-finished, checking if we need to add more jobs");
     if (
       job.data.crawlerOptions &&
-      !(await redisConnection.exists(
+      !(await redisEvictConnection.exists(
         "crawl:" + job.data.crawl_id + ":invisible_urls",
       ))
     ) {
-      await redisConnection.set(
+      await redisEvictConnection.set(
         "crawl:" + job.data.crawl_id + ":invisible_urls",
         "done",
         "EX",
@@ -143,7 +145,7 @@ async function finishCrawlIfNeeded(job: Job & { id: string }, sc: StoredCrawl) {
       const sc = (await getCrawl(job.data.crawl_id))!;
 
       const visitedUrls = new Set(
-        await redisConnection.smembers(
+        await redisEvictConnection.smembers(
           "crawl:" + job.data.crawl_id + ":visited_unique",
         ),
       );
@@ -238,11 +240,15 @@ async function finishCrawlIfNeeded(job: Job & { id: string }, sc: StoredCrawl) {
         );
         await addScrapeJobs(lockedJobs);
 
-        logger.info("Added jobs, not going for the full finish", {
-          lockedJobs: lockedJobs.length,
-        });
+        if (lockedJobs.length > 0) {
+          logger.info("Added jobs, not going for the full finish", {
+            lockedJobs: lockedJobs.length,
+          });
 
-        return;
+          return;
+        } else {
+          logger.info("No jobs added (all discovered URLs were locked), finishing crawl");
+        }
       }
     }
 
@@ -254,7 +260,7 @@ async function finishCrawlIfNeeded(job: Job & { id: string }, sc: StoredCrawl) {
         ? normalizeUrlOnlyHostname(sc.originUrl)
         : undefined;
       // Get all visited unique URLs from Redis
-      const visitedUrls = await redisConnection.smembers(
+      const visitedUrls = await redisEvictConnection.smembers(
         "crawl:" + job.data.crawl_id + ":visited_unique",
       );
       // Upload to Supabase if we have URLs and this is a crawl (not a batch scrape)
@@ -800,31 +806,37 @@ const workerFun = async (
         }
 
         if (job.id && job.data && job.data.team_id) {
+          const maxConcurrency = (await getACUCTeam(job.data.team_id, false, true, job.data.is_extract ? RateLimiterMode.Extract : RateLimiterMode.Crawl))?.concurrency ?? 2;
+
           await removeConcurrencyLimitActiveJob(job.data.team_id, job.id);
-          cleanOldConcurrencyLimitEntries(job.data.team_id);
+          await cleanOldConcurrencyLimitEntries(job.data.team_id);
 
-          // No need to check if we're under the limit here -- if the current job is finished,
-          // we are 1 under the limit, assuming the job insertion logic never over-inserts. - MG
-          const nextJob = await takeConcurrencyLimitedJob(job.data.team_id);
-          if (nextJob !== null) {
-            await pushConcurrencyLimitActiveJob(
-              job.data.team_id,
-              nextJob.id,
-              60 * 1000,
-            ); // 60s initial timeout
+          // Check if we're under the concurrency limit before adding a new job
+          const currentActiveConcurrency = (await getConcurrencyLimitActiveJobs(job.data.team_id)).length;
+          const concurrencyLimited = currentActiveConcurrency >= maxConcurrency;
 
-            await queue.add(
-              nextJob.id,
-              {
-                ...nextJob.data,
-                concurrencyLimitHit: true,
-              },
-              {
-                ...nextJob.opts,
-                jobId: nextJob.id,
-                priority: nextJob.priority,
-              },
-            );
+          if (!concurrencyLimited) {
+            const nextJob = await takeConcurrencyLimitedJob(job.data.team_id);
+            if (nextJob !== null) {
+              await pushConcurrencyLimitActiveJob(
+                job.data.team_id,
+                nextJob.id,
+                60 * 1000,
+              ); // 60s initial timeout
+
+              await queue.add(
+                nextJob.id,
+                {
+                  ...nextJob.data,
+                  concurrencyLimitHit: true,
+                },
+                {
+                  ...nextJob.opts,
+                  jobId: nextJob.id,
+                  priority: nextJob.priority,
+                },
+              );
+            }
           }
         }
       }
@@ -1150,21 +1162,6 @@ async function processJob(job: Job & { id: string }, token: string) {
       document: doc,
     };
 
-    if (job.data.webhook && job.data.mode !== "crawl" && job.data.v1) {
-      logger.debug("Calling webhook with success...", {
-        webhook: job.data.webhook,
-      });
-      await callWebhook(
-        job.data.team_id,
-        job.data.crawl_id,
-        data,
-        job.data.webhook,
-        job.data.v1,
-        job.data.crawlerOptions !== null ? "crawl.page" : "batch_scrape.page",
-        true,
-      );
-    }
-
     if (job.data.crawl_id) {
       const sc = (await getCrawl(job.data.crawl_id)) as StoredCrawl;
 
@@ -1217,7 +1214,7 @@ async function processJob(job: Job & { id: string }, token: string) {
 
           // Prevent redirect target from being visited in the crawl again
           // See lockURL
-          const x = await redisConnection.sadd(
+          const x = await redisEvictConnection.sadd(
             "crawl:" + job.data.crawl_id + ":visited",
             ...p1.map((x) => x.href),
           );
@@ -1245,9 +1242,25 @@ async function processJob(job: Job & { id: string }, token: string) {
           origin: job.data.origin,
           crawl_id: job.data.crawl_id,
           cost_tracking: costTracking,
+          pdf_num_pages: doc.metadata.numPages,
         },
         true,
       );
+
+      if (job.data.webhook && job.data.mode !== "crawl" && job.data.v1) {
+        logger.debug("Calling webhook with success...", {
+          webhook: job.data.webhook,
+        });
+        await callWebhook(
+          job.data.team_id,
+          job.data.crawl_id,
+          data,
+          job.data.webhook,
+          job.data.v1,
+          job.data.crawlerOptions !== null ? "crawl.page" : "batch_scrape.page",
+          true,
+        );
+      }
 
       indexJob(job, doc);
 
@@ -1365,28 +1378,14 @@ async function processJob(job: Job & { id: string }, token: string) {
         origin: job.data.origin,
         num_tokens: 0, // TODO: fix
         cost_tracking: costTracking,
+        pdf_num_pages: doc.metadata.numPages,
       });
       
       indexJob(job, doc);
     }
 
     if (job.data.is_scrape !== true) {
-      let creditsToBeBilled = 1; // Assuming 1 credit per document
-      if ((job.data.scrapeOptions.extract && job.data.scrapeOptions.formats?.includes("extract")) || (job.data.scrapeOptions.formats?.includes("changeTracking") && job.data.scrapeOptions.changeTrackingOptions?.modes?.includes("json"))) {
-        creditsToBeBilled = 5;
-      }
-
-      if (job.data.scrapeOptions.agent?.model?.toLowerCase() === "fire-1" || job.data.scrapeOptions.extract?.agent?.model?.toLowerCase() === "fire-1" || job.data.scrapeOptions.jsonOptions?.agent?.model?.toLowerCase() === "fire-1") {
-        if (process.env.USE_DB_AUTHENTICATION === "true") {
-          creditsToBeBilled = Math.ceil((costTracking.toJSON().totalCost ?? 1) * 1800);
-        } else {
-          creditsToBeBilled = 150;
-        }
-      }
-
-      if (doc.metadata?.proxyUsed === "stealth") {
-        creditsToBeBilled += 4;
-      }
+      let creditsToBeBilled = await calculateCreditsToBeBilled(job.data.scrapeOptions, doc, job.id, costTracking);
 
       if (
         job.data.team_id !== process.env.BACKGROUND_INDEX_TEAM_ID! &&
@@ -1437,7 +1436,7 @@ async function processJob(job: Job & { id: string }, token: string) {
 
       logger.debug("Declaring job as done...");
       await addCrawlJobDone(job.data.crawl_id, job.id, false);
-      await redisConnection.srem(
+      await redisEvictConnection.srem(
         "crawl:" + job.data.crawl_id + ":visited_unique",
         normalizeURL(job.data.url, sc),
       );
@@ -1546,10 +1545,25 @@ async function processJob(job: Job & { id: string }, token: string) {
 const app = Express();
 
 app.get("/liveness", (req, res) => {
+  // stalled check
   if (isWorkerStalled) {
     res.status(500).json({ ok: false });
   } else {
-    res.status(200).json({ ok: true });
+    // networking check
+    robustFetch({
+      url: "http://firecrawl-app-service:3002",
+      method: "GET",
+      mock: null,
+      logger: _logger,
+      abort: AbortSignal.timeout(5000),
+      ignoreResponse: true,
+    })
+      .then(() => {
+        res.status(200).json({ ok: true });
+      }).catch(e => {
+        _logger.error("WORKER NETWORKING CHECK FAILED", { error: e });
+        res.status(500).json({ ok: false });
+      });
   }
 });
 

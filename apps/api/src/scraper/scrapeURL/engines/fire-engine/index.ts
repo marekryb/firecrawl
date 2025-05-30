@@ -48,6 +48,7 @@ async function performFireEngineScrape<
     logger.child({ method: "fireEngineScrape" }),
     request,
     mock,
+    abort,
   );
 
   const startTime = Date.now();
@@ -56,6 +57,7 @@ async function performFireEngineScrape<
   let status: FireEngineCheckStatusSuccess | undefined = undefined;
 
   while (status === undefined) {
+    abort?.throwIfAborted();
     if (errors.length >= errorLimit) {
       logger.error("Error limit hit.", { errors });
       fireEngineDelete(
@@ -236,25 +238,25 @@ export async function scrapeURLWithFireEngineChromeCDP(
     request,
     timeout,
     meta.mock,
-    meta.internalOptions.abort,
+    meta.internalOptions.abort ?? AbortSignal.timeout(timeout),
   );
 
   if (
     meta.options.formats.includes("screenshot") ||
     meta.options.formats.includes("screenshot@fullPage")
   ) {
-    meta.logger.debug(
-      "Transforming screenshots from actions into screenshot field",
-      { screenshots: response.screenshots },
-    );
+    // meta.logger.debug(
+    //   "Transforming screenshots from actions into screenshot field",
+    //   { screenshots: response.screenshots },
+    // );
     if (response.screenshots) {
       response.screenshot = response.screenshots.slice(-1)[0];
       response.screenshots = response.screenshots.slice(0, -1);
     }
-    meta.logger.debug("Screenshot transformation done", {
-      screenshots: response.screenshots,
-      screenshot: response.screenshot,
-    });
+    // meta.logger.debug("Screenshot transformation done", {
+    //   screenshots: response.screenshots,
+    //   screenshot: response.screenshot,
+    // });
   }
 
   if (!response.url) {
@@ -270,6 +272,10 @@ export async function scrapeURLWithFireEngineChromeCDP(
     html: response.content,
     error: response.pageError,
     statusCode: response.pageStatusCode,
+
+    contentType: (Object.entries(response.responseHeaders ?? {}).find(
+      (x) => x[0].toLowerCase() === "content-type",
+    ) ?? [])[1] ?? undefined,
 
     screenshot: response.screenshot,
     ...(actions.length > 0
@@ -317,7 +323,7 @@ export async function scrapeURLWithFireEnginePlaywright(
     request,
     timeout,
     meta.mock,
-    meta.internalOptions.abort,
+    meta.internalOptions.abort ?? AbortSignal.timeout(timeout),
   );
 
   if (!response.url) {
@@ -333,6 +339,10 @@ export async function scrapeURLWithFireEnginePlaywright(
     html: response.content,
     error: response.pageError,
     statusCode: response.pageStatusCode,
+
+    contentType: (Object.entries(response.responseHeaders ?? {}).find(
+      (x) => x[0].toLowerCase() === "content-type",
+    ) ?? [])[1] ?? undefined,
 
     ...(response.screenshots !== undefined && response.screenshots.length > 0
       ? {
@@ -373,7 +383,7 @@ export async function scrapeURLWithFireEngineTLSClient(
     request,
     timeout,
     meta.mock,
-    meta.internalOptions.abort,
+    meta.internalOptions.abort ?? AbortSignal.timeout(timeout),
   );
 
   if (!response.url) {
@@ -389,5 +399,9 @@ export async function scrapeURLWithFireEngineTLSClient(
     html: response.content,
     error: response.pageError,
     statusCode: response.pageStatusCode,
+
+    contentType: (Object.entries(response.responseHeaders ?? {}).find(
+      (x) => x[0].toLowerCase() === "content-type",
+    ) ?? [])[1] ?? undefined,
   };
 }
